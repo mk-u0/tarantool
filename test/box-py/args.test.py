@@ -60,4 +60,10 @@ server.test_option("-e \"print(rawget(_G, 'log') == nil)\" " + \
                    script + \
                    " 1 2 3 --help")
 
+server.test_option("-b")
+server.test_option("-bl -e ''")
+
+server.test_option("-jon -e ''")
+server.test_option("-j on -e ''")
+
 sys.stdout.clear_all_filters()

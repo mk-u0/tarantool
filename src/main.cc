@@ -578,6 +578,8 @@ print_help(const char *program)
 	puts("  -v, --version\t\t\tprint program version and exit");
 	puts("  -e EXPR\t\t\texecute string 'EXPR'");
 	puts("  -l NAME\t\t\trequire library 'NAME'");
+	puts("  -j cmd \t\t\tperform LuaJIT control command");
+	puts("  -b ... \t\t\tsave or list bytecode");
 	puts("  -i\t\t\t\tenter interactive mode after executing 'SCRIPT'");
 	puts("  --\t\t\t\tstop handling options");
 	puts("  -\t\t\t\texecute stdin and stop handling options");
@@ -585,6 +587,9 @@ print_help(const char *program)
 	puts("Please visit project home page at http://tarantool.org");
 	puts("to see online documentation, submit bugs or contribute a patch.");
 }
+
+#define O_INTERACTIVE 0x1
+#define O_BYTECODE    0x2
 
 int
 main(int argc, char **argv)
@@ -597,7 +602,7 @@ main(int argc, char **argv)
 	fpconv_check();
 
 	/* Enter interactive mode after executing 'script' */
-	bool interactive = false;
+	uint32_t opt_mask = 0;
 	/* Lua interpeter options, e.g. -e and -l */
 	int optc = 0;
 	const char **optv = NULL;
@@ -608,38 +613,47 @@ main(int argc, char **argv)
 		{"version", no_argument, 0, 'v'},
 		{NULL, 0, 0, 0},
 	};
-	static const char *opts = "+hVvie:l:";
+	static const char *opts = "+hVvbij:e:l:";
 
 	int ch;
+	bool lj_arg = false;
 	while ((ch = getopt_long(argc, argv, opts, longopts, NULL)) != -1) {
 		switch (ch) {
-		case 'V':
-		case 'v':
-			print_version();
-			return 0;
-		case 'h':
-			print_help(basename(argv[0]));
-			return 0;
-		case 'i':
-			/* Force interactive mode */
-			interactive = true;
-			break;
-		case 'l':
-		case 'e':
-			/* Save Lua interepter options to optv as is */
-			if (optc == 0) {
-				optv = (const char **) calloc(argc,
-							      sizeof(optv[0]));
-				if (optv == NULL)
-					panic_syserror("No enough memory for arguments");
-			}
-			optv[optc++] = ch == 'l' ? "-l" : "-e";
-			optv[optc++] = optarg;
-			break;
-		default:
-			/* "invalid option" is printed by getopt */
-			return EX_USAGE;
+			case 'V':
+			case 'v':
+				print_version();
+				return 0;
+			case 'h':
+				print_help(basename(argv[0]));
+				return 0;
+			case 'i':
+				/* Force interactive mode */
+				opt_mask |= O_INTERACTIVE;
+				break;
+			case 'b':
+				opt_mask |= O_BYTECODE;
+				lj_arg = true;
+				break;
+			case 'j':
+			case 'l':
+			case 'e':
+				/* Save Lua interepter options to optv as is */
+				if (optc == 0) {
+					optv = (const char **) calloc(argc, sizeof(optv[0]));
+					if (optv == NULL)
+						panic_syserror("No enough memory for arguments");
+				}
+				if(ch == 'l') optv[optc++] = "-l";
+				else if(ch == 'j') optv[optc++] = "-j";
+				else optv[optc++] = "-e";
+				optv[optc++] = optarg;
+				break;
+			default:
+				/* "invalid option" is printed by getopt */
+				return EX_USAGE;
 		}
+
+		if(lj_arg) break;
 	}
 
 	/* Shift arguments */
@@ -647,18 +661,20 @@ main(int argc, char **argv)
 	for (int i = 1; i < argc; i++)
 		argv[i] = argv[optind + i - 1];
 
-	if (argc > 1 && strcmp(argv[1], "-") && access(argv[1], R_OK) != 0) {
-		/*
-		 * Somebody made a mistake in the file
-		 * name. Be nice: open the file to set
-		 * errno.
-		 */
-		int fd = open(argv[1], O_RDONLY);
-		int save_errno = errno;
-		if (fd >= 0)
-			close(fd);
-		printf("Can't open script %s: %s\n", argv[1], strerror(save_errno));
-		return save_errno;
+	if(!(opt_mask & O_BYTECODE) && argc > 1 &&
+	    strcmp(argv[1], "-") && access(argv[1], R_OK) != 0) {
+	    /*
+	    * Somebody made a mistake in the file
+	    * name. Be nice: open the file to set
+	    * errno.
+	    */
+	    int fd = open(argv[1], O_RDONLY);
+	    int save_errno = errno;
+	    if (fd >= 0)
+		    close(fd);
+	    printf("Can't open script %s: %s\n",
+		argv[1], strerror(save_errno));
+		    return save_errno;
 	}
 
 	argv = title_init(argc, argv);
@@ -749,13 +765,16 @@ main(int argc, char **argv)
 			panic("%s", "can't init event loop");
 
 		int events = ev_activecnt(loop());
+
+		if(opt_mask & O_BYTECODE)
+			return tarantool_lua_dump_bytecode(argv);
 		/*
 		 * Load user init script.  The script should have access
 		 * to Tarantool Lua API (box.cfg, box.fiber, etc...) that
 		 * is why script must run only after the server was fully
 		 * initialized.
 		 */
-		if (tarantool_lua_run_script(script, interactive, optc, optv,
+		if (tarantool_lua_run_script(script, opt_mask & O_INTERACTIVE, optc, optv,
 					     main_argc, main_argv) != 0)
 			diag_raise();
 		/*
