@@ -583,7 +583,7 @@ raft_test_vote_skip(void)
 static void
 raft_test_leader_resign(void)
 {
-	raft_start_test(23);
+	raft_start_test(24);
 	struct raft_node node;
 
 	/*
@@ -622,8 +622,10 @@ raft_test_leader_resign(void)
 	/* Multiple candidate reset won't break anything. */
 	raft_node_cfg_is_candidate(&node, false);
 
+	int update_count = node.update_count;
 	is(raft_node_send_follower(&node, 1, 2), 0, "message is accepted");
 	is(node.raft.leader, 0, "leader has resigned");
+	is(node.update_count, update_count + 1, "resign makes a broadcast");
 
 	raft_run_for(node.cfg_death_timeout * 2);
 
@@ -1565,7 +1567,7 @@ raft_test_bump_term_before_cfg()
 static void
 raft_test_split_vote(void)
 {
-	raft_start_test(58);
+	raft_start_test(64);
 	struct raft_node node;
 	raft_node_create(&node);
 
@@ -1855,6 +1857,37 @@ raft_test_split_vote(void)
 	raft_run_next_event();
 	is(node.raft.term, 3, "bump term");
 	is(node.raft.vote, 1, "vote for self");
+
+	/*
+	 * Split vote can make delay to next election 0. Timer with 0 timeout
+	 * has a special state in libev. Another vote can come on the next
+	 * even loop iteration just before the timer is triggered. It should be
+	 * ready to the special state of the timer.
+	 */
+	raft_node_destroy(&node);
+	raft_node_create(&node);
+	raft_node_cfg_cluster_size(&node, 3);
+	raft_node_cfg_election_quorum(&node, 3);
+	raft_node_cfg_max_shift(&node, 0);
+
+	raft_run_next_event();
+	is(node.raft.term, 2, "bump term");
+	is(node.raft.vote, 1, "vote for self");
+	is(raft_node_send_vote_response(&node,
+		2 /* Term. */,
+		2 /* Vote. */,
+		2 /* Source. */
+	), 0, "vote response for 2 from 2");
+
+	is(node.raft.timer.repeat, 0, "planned new election after yield");
+
+	is(raft_node_send_vote_response(&node,
+		2 /* Term. */,
+		3 /* Vote. */,
+		3 /* Source. */
+	), 0, "vote response for 3 from 3");
+
+	is(node.raft.timer.repeat, 0, "still waiting for yield");
 
 	raft_node_destroy(&node);
 	raft_finish_test();

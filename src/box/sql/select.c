@@ -4648,9 +4648,7 @@ is_simple_count(struct Select *select, struct AggInfo *agg_info)
 		return NULL;
 	if (NEVER(agg_info->nFunc == 0))
 		return NULL;
-	assert(agg_info->aFunc->func->def->language ==
-	       FUNC_LANGUAGE_SQL_BUILTIN);
-	if (sql_func_flag_is_set(agg_info->aFunc->func, SQL_FUNC_COUNT) ||
+	if (strcmp(agg_info->aFunc->func->def->name, "COUNT") != 0 ||
 	    (agg_info->aFunc->pExpr->x.pList != NULL &&
 	     agg_info->aFunc->pExpr->x.pList->nExpr > 0))
 		return NULL;
@@ -5562,6 +5560,22 @@ resetAccumulator(Parse * pParse, AggInfo * pAggInfo)
 	}
 }
 
+static inline void
+finalize_agg_function(struct Vdbe *vdbe, const struct AggInfo_func *agg_func)
+{
+	if (agg_func->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN) {
+		sqlVdbeAddOp1(vdbe, OP_AggFinal, agg_func->iMem);
+		sqlVdbeAppendP4(vdbe, agg_func->func, P4_FUNC);
+		return;
+	}
+	if (sql_func_finalize(agg_func->pExpr->u.zToken) == NULL)
+		return;
+	const char *name = tt_sprintf("%s_finalize", agg_func->pExpr->u.zToken);
+	const char *str = sqlDbStrDup(sql_get(), name);
+	sqlVdbeAddOp4(vdbe, OP_FunctionByName, 1, agg_func->iMem,
+		      agg_func->iMem, str, P4_DYNAMIC);
+}
+
 /*
  * Invoke the OP_AggFinalize opcode for every aggregate function
  * in the AggInfo structure.
@@ -5573,11 +5587,8 @@ finalizeAggFunctions(Parse * pParse, AggInfo * pAggInfo)
 	int i;
 	struct AggInfo_func *pF;
 	for (i = 0, pF = pAggInfo->aFunc; i < pAggInfo->nFunc; i++, pF++) {
-		ExprList *pList = pF->pExpr->x.pList;
 		assert(!ExprHasProperty(pF->pExpr, EP_xIsSelect));
-		sqlVdbeAddOp2(v, OP_AggFinal, pF->iMem,
-				  pList ? pList->nExpr : 0);
-		sqlVdbeAppendP4(v, pF->func, P4_FUNC);
+		finalize_agg_function(v, pF);
 	}
 }
 
@@ -5604,7 +5615,7 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 		assert(!ExprHasProperty(pF->pExpr, EP_xIsSelect));
 		if (pList) {
 			nArg = pList->nExpr;
-			regAgg = sqlGetTempRange(pParse, nArg);
+			regAgg = pF->iMem - nArg;
 			sqlExprCodeExprList(pParse, pList, regAgg, 0,
 						SQL_ECEL_DUP);
 		} else {
@@ -5644,10 +5655,17 @@ updateAccumulator(Parse * pParse, AggInfo * pAggInfo)
 			pParse->is_aborted = true;
 			return;
 		}
-		sqlVdbeAddOp3(v, OP_AggStep, nArg, regAgg, pF->iMem);
-		sqlVdbeAppendP4(v, ctx, P4_FUNCCTX);
-		sql_expr_type_cache_change(pParse, regAgg, nArg);
-		sqlReleaseTempRange(pParse, regAgg, nArg);
+		if (pF->func->def->language == FUNC_LANGUAGE_SQL_BUILTIN) {
+			sqlVdbeAddOp3(v, OP_AggStep, nArg, regAgg, pF->iMem);
+			sqlVdbeAppendP4(v, ctx, P4_FUNCCTX);
+		} else {
+			const char *name = pF->func->def->name;
+			uint32_t len = pF->func->def->name_len;
+			const char *str = sqlDbStrNDup(pParse->db, name, len);
+			assert(regAgg == pF->iMem - nArg);
+			sqlVdbeAddOp4(v, OP_FunctionByName, nArg + 1, regAgg,
+				      pF->iMem, str, P4_DYNAMIC);
+		}
 		if (addrNext) {
 			sqlVdbeResolveLabel(v, addrNext);
 			sqlExprCacheClear(pParse);

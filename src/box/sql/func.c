@@ -2060,21 +2060,40 @@ sql_func_find(struct Expr *expr)
 		return NULL;
 	}
 	int n = expr->x.pList != NULL ? expr->x.pList->nExpr : 0;
-	if (func->def->param_count != n) {
+	int argc = func->def->aggregate == FUNC_AGGREGATE_GROUP ?
+		   func->def->param_count - 1 : func->def->param_count;
+	assert(argc >= 0);
+	if (argc != n) {
 		diag_set(ClientError, ER_FUNC_WRONG_ARG_COUNT, name,
-			 tt_sprintf("%d", func->def->param_count), n);
+			 tt_sprintf("%d", argc), n);
 		return NULL;
 	}
 	return func;
+}
+
+struct func *
+sql_func_finalize(const char *name)
+{
+	const char *finalize_name = tt_sprintf("%s_finalize", name);
+	uint32_t len = strlen(finalize_name);
+	struct func *finalize = func_by_name(finalize_name, len);
+	if (finalize == NULL ||
+	    finalize->def->param_count != 1 ||
+	    finalize->def->aggregate == FUNC_AGGREGATE_GROUP)
+		return NULL;
+	return finalize;
 }
 
 uint32_t
 sql_func_flags(const char *name)
 {
 	struct sql_func_dictionary *dict = built_in_func_get(name);
-	if (dict == NULL)
+	if (dict != NULL)
+		return dict->flags;
+	struct func *func = func_by_name(name, strlen(name));
+	if (func == NULL || func->def->aggregate != FUNC_AGGREGATE_GROUP)
 		return 0;
-	return dict->flags;
+	return SQL_FUNC_AGG;
 }
 
 static struct func_vtab func_sql_builtin_vtab;

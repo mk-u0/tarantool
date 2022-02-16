@@ -1117,8 +1117,6 @@ struct type_def {
 					 */
 #define SQL_FUNC_LENGTH   0x0040	/* Built-in length() function */
 #define SQL_FUNC_TYPEOF   0x0080	/* Built-in typeof() function */
-/** Built-in count() function. */
-#define SQL_FUNC_COUNT    0x0100
 #define SQL_FUNC_COALESCE 0x0200	/* Built-in coalesce() or ifnull() */
 #define SQL_FUNC_UNLIKELY 0x0400	/* Built-in unlikely() function */
 /** Built-in min() or least() function. */
@@ -4309,6 +4307,10 @@ sql_func_find(struct Expr *expr);
 /** Code an OP_ApplyType opcode that will force types onto arguments. */
 int
 sql_emit_args_types(struct Vdbe *v, int reg, struct func *base, uint32_t argc);
+
+/** Return a function that is a finalizer for function with given name. */
+struct func *
+sql_func_finalize(const char *name);
 
 /**
  * Return the parameters of the function with the given name. If the function

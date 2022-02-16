@@ -136,6 +136,10 @@ applier_log_error(struct applier *applier, struct error *e)
 /**
  * A helper function which switches the applier to FOLLOW state
  * if it has synchronized with its master.
+ *
+ * This function is called from on_commit triggers, where yields
+ * are prohibited. It assumes that APPLIER_FOLLOW triggers don't
+ * yield. (Should we add a separate callback to be called on sync?)
  */
 static inline void
 applier_check_sync(struct applier *applier)
@@ -154,6 +158,23 @@ applier_check_sync(struct applier *applier)
 	}
 }
 
+/**
+ * A helper function to create an applier fiber. Basically, it's a wrapper
+ * around fiber_new_xc(), which appends the applier URI to the fiber name and
+ * makes the new fiber joinable. Note, this function creates a new fiber, but
+ * doesn't start it.
+ */
+static struct fiber *
+applier_fiber_new(struct applier *applier, const char *name, fiber_func func)
+{
+	char buf[FIBER_NAME_MAX];
+	int pos = snprintf(buf, sizeof(buf), "%s/", name);
+	uri_format(buf + pos, sizeof(buf) - pos, &applier->uri, false);
+	struct fiber *f = fiber_new_xc(buf, func);
+	fiber_set_joinable(f, true);
+	return f;
+}
+
 /*
  * Fiber function to write vclock to replication master.
  * To track connection status, replica answers master
@@ -163,53 +184,27 @@ applier_check_sync(struct applier *applier)
  * On such requests replica also responds with vclock.
  */
 static int
-applier_writer_f(va_list ap)
+applier_thread_writer_f(va_list ap)
 {
 	struct applier *applier = va_arg(ap, struct applier *);
-
-	/* ID is permanent while applier is alive */
-	uint32_t replica_id = applier->instance_id;
-
 	while (!fiber_is_cancelled()) {
 		/*
 		 * Tarantool >= 1.7.7 sends periodic heartbeat
 		 * messages so we don't need to send ACKs every
 		 * replication_timeout seconds any more.
 		 */
-		if (!applier->has_acks_to_send) {
+		if (!applier->thread.has_acks_to_send) {
+			double timeout = replication_timeout;
 			if (applier->version_id >= version_id(1, 7, 7))
-				fiber_cond_wait_timeout(&applier->writer_cond,
-							TIMEOUT_INFINITY);
-			else
-				fiber_cond_wait_timeout(&applier->writer_cond,
-							replication_timeout);
+				timeout = TIMEOUT_INFINITY;
+			fiber_cond_wait_timeout(&applier->thread.writer_cond,
+						timeout);
 		}
-		/*
-		 * A writer fiber is going to be awaken after a commit or
-		 * a heartbeat message. So this is an appropriate place to
-		 * update an applier status because the applier state could
-		 * yield and doesn't fit into a commit trigger.
-		 */
-		applier_check_sync(applier);
-
-		/* Send ACKs only when in FOLLOW mode ,*/
-		if (applier->state != APPLIER_SYNC &&
-		    applier->state != APPLIER_FOLLOW)
-			continue;
 		try {
-			applier->has_acks_to_send = false;
+			applier->thread.has_acks_to_send = false;
 			struct xrow_header xrow;
 			xrow_encode_vclock(&xrow, &replicaset.vclock);
-			/*
-			 * For relay lag statistics we report last
-			 * written transaction timestamp in tm field.
-			 *
-			 * If user delete the node from _cluster space,
-			 * we obtain a nil pointer here.
-			 */
-			struct replica *r = replica_by_id(replica_id);
-			if (likely(r != NULL))
-				xrow.tm = r->applier_txn_last_tm;
+			xrow.tm = applier->thread.txn_last_tm;
 			coio_write_xrow(&applier->io, &xrow);
 			ERROR_INJECT(ERRINJ_APPLIER_SLOW_ACK, {
 				fiber_sleep(0.01);
@@ -1312,8 +1307,52 @@ finish:
 static inline void
 applier_signal_ack(struct applier *applier)
 {
-	fiber_cond_signal(&applier->writer_cond);
-	applier->has_acks_to_send = true;
+	if (!applier->is_ack_sent) {
+		/*
+		 * For relay lag statistics we report last written transaction
+		 * timestamp in tm field. If user delete the node from _cluster
+		 * space, we obtain a nil pointer here.
+		 */
+		struct replica *r = replica_by_id(applier->instance_id);
+		applier->ack_msg.txn_last_tm = (r == NULL ? 0 :
+						r->applier_txn_last_tm);
+		cmsg_init(&applier->ack_msg.base, applier->ack_route);
+		cpipe_push(&applier->applier_thread->thread_pipe,
+			   &applier->ack_msg.base);
+		applier->is_ack_sent = true;
+	} else {
+		applier->is_ack_pending = true;
+	}
+}
+
+/**
+ * Callback invoked by the applier thread to wake up the writer fiber.
+ */
+static void
+applier_thread_signal_ack(struct cmsg *base)
+{
+	struct applier_ack_msg *msg = (struct applier_ack_msg *)base;
+	struct applier *applier = container_of(msg, struct applier, ack_msg);
+	fiber_cond_signal(&applier->thread.writer_cond);
+	applier->thread.has_acks_to_send = true;
+	applier->thread.txn_last_tm = msg->txn_last_tm;
+}
+
+/**
+ * Callback invoked by the tx thread to resend the message if ACK was signalled
+ * while it was en route.
+ */
+static void
+applier_complete_ack(struct cmsg *base)
+{
+	struct applier_ack_msg *msg = (struct applier_ack_msg *)base;
+	struct applier *applier = container_of(msg, struct applier, ack_msg);
+	assert(applier->is_ack_sent);
+	applier->is_ack_sent = false;
+	if (applier->is_ack_pending) {
+		applier->is_ack_pending = false;
+		applier_signal_ack(applier);
+	}
 }
 
 /*
@@ -1325,6 +1364,7 @@ applier_on_wal_write(struct trigger *trigger, void *event)
 	(void) event;
 	struct applier *applier = (struct applier *)trigger->data;
 	applier_signal_ack(applier);
+	applier_check_sync(applier);
 	return 0;
 }
 
@@ -1342,20 +1382,9 @@ applier_on_rollback(struct trigger *trigger, void *event)
 			       diag_last_error(&replicaset.applier.diag));
 	}
 	/* Stop the applier fiber. */
-	fiber_cancel(applier->reader);
+	fiber_cancel(applier->fiber);
 	return 0;
 }
-
-/** The underlying thread behind a number of appliers. */
-struct applier_thread {
-	struct cord cord;
-	/** The single thread endpoint. */
-	struct cbus_endpoint endpoint;
-	/** A pipe from the applier thread to tx. */
-	struct cpipe tx_pipe;
-	/** A pipe from tx to the applier thread. */
-	struct cpipe thread_pipe;
-};
 
 /**
  * Propagate the exception causing the applier death to tx from applier
@@ -1446,6 +1475,7 @@ applier_process_batch(struct cmsg *base)
 			if (applier_handle_raft(applier, txr) != 0)
 				diag_raise();
 			applier_signal_ack(applier);
+			applier_check_sync(applier);
 		} else if (applier_apply_tx(applier, &tx->rows) != 0) {
 			diag_raise();
 		}
@@ -1760,9 +1790,18 @@ applier_thread_msgs_init(struct applier *applier)
 static inline void
 applier_thread_fiber_init(struct applier *applier)
 {
-	applier->thread.reader = fiber_new_xc("reader", applier_thread_reader_f);
-	fiber_set_joinable(applier->thread.reader, true);
+	assert(applier->thread.reader == NULL);
+	assert(applier->thread.writer == NULL);
+	applier->thread.reader = applier_fiber_new(applier, "reader",
+						   applier_thread_reader_f);
 	fiber_start(applier->thread.reader, applier);
+	if (applier->version_id >= version_id(1, 7, 4)) {
+		/* Enable replication ACKs for newer servers */
+		applier->thread.writer = applier_fiber_new(
+			applier, "writer", applier_thread_writer_f);
+		fiber_start(applier->thread.writer, applier);
+	}
+
 }
 
 struct applier_cfg_msg {
@@ -1777,6 +1816,7 @@ applier_thread_attach_applier(struct cbus_call_msg *base)
 	struct applier *applier = ((struct applier_cfg_msg *)base)->applier;
 
 	lsregion_create(&applier->thread.lsr, &runtime);
+	fiber_cond_create(&applier->thread.writer_cond);
 	applier_thread_ibuf_init(applier);
 	applier_thread_msgs_init(applier);
 	applier_thread_fiber_init(applier);
@@ -1789,11 +1829,16 @@ static int
 applier_thread_detach_applier(struct cbus_call_msg *base)
 {
 	struct applier *applier = ((struct applier_cfg_msg *)base)->applier;
-
+	if (applier->thread.writer != NULL) {
+		fiber_cancel(applier->thread.writer);
+		fiber_join(applier->thread.writer);
+		applier->thread.writer = NULL;
+	}
 	fiber_cancel(applier->thread.reader);
 	fiber_join(applier->thread.reader);
+	applier->thread.reader = NULL;
 	lsregion_destroy(&applier->thread.lsr);
-
+	fiber_cond_destroy(&applier->thread.writer_cond);
 	return 0;
 }
 
@@ -1821,6 +1866,11 @@ static void
 applier_thread_data_destroy(struct applier *applier)
 {
 	struct applier_thread *thread = applier->applier_thread;
+	/*
+	 * No new ACK must be signalled after this point. Make sure that
+	 * the ACK message en route won't be resent upon returning to tx.
+	 */
+	applier->is_ack_pending = false;
 
 	struct applier_cfg_msg *msg =
 		(struct applier_cfg_msg *)xmalloc(sizeof(*msg));
@@ -1851,6 +1901,8 @@ applier_thread_data_create(struct applier *applier,
 	applier->applier_thread = thread;
 	fiber_cond_create(&applier->msg_cond);
 	applier->pending_msg_cnt = 0;
+	applier->ack_route[0] = {applier_thread_signal_ack, &thread->tx_pipe};
+	applier->ack_route[1] = {applier_complete_ack, NULL};
 
 	struct applier_cfg_msg *msg =
 		(struct applier_cfg_msg *)xmalloc(sizeof(*msg));
@@ -1868,34 +1920,6 @@ applier_thread_data_create(struct applier *applier,
 	applier_cfg_msg_free(&msg->base);
 
 	return 0;
-}
-
-/**
- * Subscribe to the replication stream. Use a separate decoding thread.
- */
-static void
-applier_thread_subscribe(struct applier *applier)
-{
-	struct applier_thread *thread = applier_thread_next();
-
-	if (applier_thread_data_create(applier, thread) != 0)
-		diag_raise();
-
-
-	auto guard = make_scoped_guard([&]{
-		applier_thread_data_destroy(applier);
-	});
-
-	while (true) {
-		if (applier->pending_msg_cnt == 0) {
-			fiber_cond_wait(&applier->msg_cond);
-		}
-		fiber_testcancel();
-		struct applier_msg *msg = applier_thread_msg_take(applier);
-		msg->f(&msg->base);
-	}
-
-	unreachable();
 }
 
 /**
@@ -1995,20 +2019,15 @@ applier_subscribe(struct applier *applier)
 
 	/* Re-enable warnings after successful execution of SUBSCRIBE */
 	applier->last_logged_errcode = 0;
-	if (applier->version_id >= version_id(1, 7, 4)) {
-		/* Enable replication ACKs for newer servers */
-		assert(applier->writer == NULL);
-
-		char name[FIBER_NAME_MAX];
-		int pos = snprintf(name, sizeof(name), "applierw/");
-		uri_format(name + pos, sizeof(name) - pos, &applier->uri, false);
-
-		applier->writer = fiber_new_xc(name, applier_writer_f);
-		fiber_set_joinable(applier->writer, true);
-		fiber_start(applier->writer, applier);
-	}
-
 	applier->lag = TIMEOUT_INFINITY;
+
+	/** Attach the applier to a thread. */
+	struct applier_thread *thread = applier_thread_next();
+	if (applier_thread_data_create(applier, thread) != 0)
+		diag_raise();
+	auto thread_guard = make_scoped_guard([&]{
+		applier_thread_data_destroy(applier);
+	});
 
 	/*
 	 * Register triggers to handle WAL writes and rollbacks.
@@ -2016,6 +2035,11 @@ applier_subscribe(struct applier *applier)
 	 * Note we use them for syncronous packets handling as well
 	 * thus when changing make sure that synchro handling won't
 	 * be broken.
+	 *
+	 * Must be done after initializing the thread, because we
+	 * want triggers to be cleared before the applier is detached
+	 * from a thread (i.e. thread_guard must be destroyed before
+	 * trigger_guard).
 	 */
 	struct trigger on_wal_write;
 	trigger_create(&on_wal_write, applier_on_wal_write, applier, NULL);
@@ -2033,18 +2057,21 @@ applier_subscribe(struct applier *applier)
 	/*
 	 * Process a stream of rows from the binary log.
 	 */
-	applier_thread_subscribe(applier);
+	while (true) {
+		if (applier->pending_msg_cnt == 0) {
+			fiber_cond_wait(&applier->msg_cond);
+		}
+		fiber_testcancel();
+		struct applier_msg *msg = applier_thread_msg_take(applier);
+		msg->f(&msg->base);
+	}
+	unreachable();
 }
 
 static inline void
 applier_disconnect(struct applier *applier, enum applier_state state)
 {
 	applier_set_state(applier, state);
-	if (applier->writer != NULL) {
-		fiber_cancel(applier->writer);
-		fiber_join(applier->writer);
-		applier->writer = NULL;
-	}
 	if (iostream_is_initialized(&applier->io))
 		iostream_close(&applier->io);
 	/* Clear all unparsed input. */
@@ -2226,32 +2253,21 @@ reconnect:
 void
 applier_start(struct applier *applier)
 {
-	char name[FIBER_NAME_MAX];
-	assert(applier->reader == NULL);
-
-	int pos = snprintf(name, sizeof(name), "applier/");
-	uri_format(name + pos, sizeof(name) - pos, &applier->uri, false);
-
-	struct fiber *f = fiber_new_xc(name, applier_f);
-	/**
-	 * So that we can safely grab the status of the
-	 * fiber any time we want.
-	 */
-	fiber_set_joinable(f, true);
-	applier->reader = f;
-	fiber_start(f, applier);
+	assert(applier->fiber == NULL);
+	applier->fiber = applier_fiber_new(applier, "applier", applier_f);
+	fiber_start(applier->fiber, applier);
 }
 
 void
 applier_stop(struct applier *applier)
 {
-	struct fiber *f = applier->reader;
+	struct fiber *f = applier->fiber;
 	if (f == NULL)
 		return;
 	fiber_cancel(f);
 	fiber_join(f);
 	applier_set_state(applier, APPLIER_OFF);
-	applier->reader = NULL;
+	applier->fiber = NULL;
 }
 
 struct applier *
@@ -2270,7 +2286,6 @@ applier_new(struct uri *uri)
 	applier->last_row_time = ev_monotonic_now(loop());
 	rlist_create(&applier->on_state);
 	fiber_cond_create(&applier->resume_cond);
-	fiber_cond_create(&applier->writer_cond);
 	diag_create(&applier->diag);
 
 	return applier;
@@ -2279,7 +2294,7 @@ applier_new(struct uri *uri)
 void
 applier_delete(struct applier *applier)
 {
-	assert(applier->reader == NULL && applier->writer == NULL);
+	assert(applier->fiber == NULL);
 	assert(!iostream_is_initialized(&applier->io));
 	iostream_ctx_destroy(&applier->io_ctx);
 	ibuf_destroy(&applier->ibuf);
@@ -2292,7 +2307,7 @@ applier_delete(struct applier *applier)
 void
 applier_resume(struct applier *applier)
 {
-	assert(!fiber_is_dead(applier->reader));
+	assert(!fiber_is_dead(applier->fiber));
 	applier->is_paused = false;
 	fiber_cond_signal(&applier->resume_cond);
 }
@@ -2301,7 +2316,7 @@ void
 applier_pause(struct applier *applier)
 {
 	/* Sleep until applier_resume() wake us up */
-	assert(fiber() == applier->reader);
+	assert(fiber() == applier->fiber);
 	assert(!applier->is_paused);
 	applier->is_paused = true;
 	while (applier->is_paused && !fiber_is_cancelled())
@@ -2370,8 +2385,8 @@ applier_wait_for_state(struct applier_on_state *trigger, double timeout)
 		assert(applier->state == APPLIER_OFF ||
 		       applier->state == APPLIER_STOPPED);
 		/* Re-throw the original error */
-		assert(!diag_is_empty(&applier->reader->diag));
-		diag_move(&applier->reader->diag, &fiber()->diag);
+		assert(!diag_is_empty(&applier->fiber->diag));
+		diag_move(&applier->fiber->diag, &fiber()->diag);
 		return -1;
 	}
 	return 0;
