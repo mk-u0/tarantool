@@ -85,6 +85,7 @@
 #include "audit.h"
 #include "trivia/util.h"
 #include "version.h"
+#include "memory.h"
 
 static char status[64] = "unknown";
 
@@ -1981,6 +1982,20 @@ box_set_snap_io_rate_limit(void)
 }
 
 void
+box_set_runtime_memory(void)
+{
+	ssize_t size = box_check_memory_quota("runtime_memory");
+	if (size < 0)
+		diag_raise();
+
+	if (runtime_set_memory(size) != 0) {
+		diag_set(ClientError, ER_CFG, "runtime_memory",
+			 "cannot decrease memory size at runtime");
+		diag_raise();
+	}
+}
+
+void
 box_set_memtx_memory(void)
 {
 	struct memtx_engine *memtx;
@@ -3655,6 +3670,7 @@ box_cfg_xc(void)
 	rmean_error = rmean_new(rmean_error_strings, RMEAN_ERROR_LAST);
 
 	gc_init();
+	box_set_runtime_memory();
 	engine_init();
 	schema_init();
 	replication_init(cfg_geti_default("replication_threads", 1));

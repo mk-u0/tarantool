@@ -6,6 +6,9 @@ local private = require('box.internal')
 local urilib = require('uri')
 local math = require('math')
 local fiber = require('fiber')
+local ffi = require('ffi')
+
+ffi.cdef('size_t get_quota_max();');
 
 -- Function decorator that is used to prevent box.cfg() from
 -- being called concurrently by different fibers.
@@ -38,6 +41,7 @@ local ifdef_feedback_set_params =
 -- all available options
 local default_cfg = {
     listen              = nil,
+    runtime_memory      = ffi.C.get_quota_max(),
     memtx_memory        = 256 * 1024 *1024,
     strip_core          = true,
     memtx_min_tuple_size = 16,
@@ -149,6 +153,7 @@ local module_cfg_type = {
 -- types here.
 local template_cfg = {
     listen              = 'string, number, table',
+    runtime_memory      = 'number',
     memtx_memory        = 'number',
     strip_core          = 'boolean',
     memtx_min_tuple_size  = 'number',
@@ -295,6 +300,7 @@ local dynamic_cfg = {
     too_long_threshold      = private.cfg_set_too_long_threshold,
     snap_io_rate_limit      = private.cfg_set_snap_io_rate_limit,
     read_only               = private.cfg_set_read_only,
+    runtime_memory          = private.cfg_set_runtime_memory,
     memtx_memory            = private.cfg_set_memtx_memory,
     memtx_max_tuple_size    = private.cfg_set_memtx_max_tuple_size,
     vinyl_memory            = private.cfg_set_vinyl_memory,
@@ -404,6 +410,7 @@ end
 
 local dynamic_cfg_skip_at_load = {
     listen                  = true,
+    runtime_memory          = true,
     memtx_memory            = true,
     memtx_max_tuple_size    = true,
     vinyl_memory            = true,

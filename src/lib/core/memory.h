@@ -50,6 +50,13 @@ memory_init(void);
 
 void
 memory_free(void);
+
+size_t
+get_quota_max();
+
+int
+runtime_set_memory(size_t size);
+
 #if defined(__cplusplus)
 } /* extern "C" */
 #endif /* defined(__cplusplus) */

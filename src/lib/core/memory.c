@@ -32,11 +32,11 @@
 #include "small/quota.h"
 
 struct slab_arena runtime;
+struct quota runtime_quota;
 
 void
 memory_init(void)
 {
-	static struct quota runtime_quota;
 	const size_t SLAB_SIZE = 4 * 1024 * 1024;
 	/* default quota initialization */
 	quota_init(&runtime_quota, QUOTA_MAX);
@@ -57,4 +57,19 @@ memory_free(void)
 #if 0
 	slab_arena_destroy(&runtime);
 #endif
+}
+
+size_t
+get_quota_max()
+{
+	return QUOTA_MAX;
+}
+
+int
+runtime_set_memory(size_t size)
+{
+	if (size < quota_used(&runtime_quota))
+		return -1;
+	quota_set(&runtime_quota, size);
+	return 0;
 }
