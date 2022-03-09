@@ -376,6 +376,7 @@ relay_stop(struct relay *relay)
 	 */
 	relay->txn_lag = 0;
 	relay->tx.txn_lag = 0;
+	fiber_cond_broadcast(&box_raft_on_message_cond);
 }
 
 void
@@ -1101,6 +1102,11 @@ tx_raft_msg_return(struct cmsg *base)
 	msg->relay->tx.is_raft_push_sent = false;
 	if (msg->relay->tx.is_raft_push_pending)
 		relay_push_raft_msg(msg->relay);
+
+	if (diag_is_empty(&msg->relay->diag))
+		msg->relay->replica->sent_term = msg->req.term;
+
+	fiber_cond_broadcast(&box_raft_on_message_cond);
 }
 
 void
@@ -1153,6 +1159,7 @@ relay_send_row(struct xstream *stream, struct xrow_header *packet)
 	/* Check if the rows from the instance are filtered. */
 	if ((1 << packet->replica_id & relay->id_filter) != 0)
 		return;
+
 	/*
 	 * We're feeding a WAL, thus responding to FINAL JOIN or SUBSCRIBE
 	 * request. If this is FINAL JOIN (i.e. relay->replica is NULL),
