@@ -1004,7 +1004,8 @@ apply_synchro_req(uint32_t replica_id, struct xrow_header *row, struct synchro_r
 	 * before trying to commit. But that requires extra steps from the
 	 * transactions side, including the async ones.
 	 */
-	txn_limbo_begin(&txn_limbo);
+	if (txn_limbo_begin(&txn_limbo, req) != 0)
+		goto err_log;
 	if (journal_write(&entry.base) != 0)
 		goto err;
 	if (entry.base.res < 0) {
@@ -1016,6 +1017,7 @@ apply_synchro_req(uint32_t replica_id, struct xrow_header *row, struct synchro_r
 
 err:
 	txn_limbo_rollback(&txn_limbo);
+err_log:
 	diag_log();
 	return -1;
 }

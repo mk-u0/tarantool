@@ -309,12 +309,10 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry);
 
 /**
  * Initiate execution of a synchronous replication request.
+ *
  */
-static inline void
-txn_limbo_begin(struct txn_limbo *limbo)
-{
-	latch_lock(&limbo->promote_latch);
-}
+int
+txn_limbo_begin(struct txn_limbo *limbo, const struct synchro_request *req);
 
 /** Commit a synchronous replication request. */
 static inline void
@@ -335,7 +333,7 @@ void
 txn_limbo_apply(struct txn_limbo *limbo, const struct synchro_request *req);
 
 /** Process a synchronous replication request. */
-void
+int
 txn_limbo_process(struct txn_limbo *limbo, const struct synchro_request *req);
 
 /**

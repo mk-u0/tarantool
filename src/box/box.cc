@@ -1774,15 +1774,12 @@ box_wait_limbo_acked(double timeout)
 }
 
 /** Write and process a PROMOTE request. */
-static void
+static int
 box_issue_promote(uint32_t prev_leader_id, int64_t promote_lsn)
 {
 	struct raft *raft = box_raft();
 	assert(raft->volatile_term == raft->term);
 	assert(promote_lsn >= 0);
-	txn_limbo_begin(&txn_limbo);
-	txn_limbo_write_promote(&txn_limbo, promote_lsn,
-				raft->term);
 	struct synchro_request req = {
 		.type = IPROTO_RAFT_PROMOTE,
 		.replica_id = prev_leader_id,
@@ -1790,23 +1787,25 @@ box_issue_promote(uint32_t prev_leader_id, int64_t promote_lsn)
 		.lsn = promote_lsn,
 		.term = raft->term,
 	};
+	if (txn_limbo_begin(&txn_limbo, &req) != 0)
+		return -1;
+	txn_limbo_write_promote(&txn_limbo, promote_lsn,
+				raft->term);
 	txn_limbo_apply(&txn_limbo, &req);
 	txn_limbo_commit(&txn_limbo);
 	assert(txn_limbo_is_empty(&txn_limbo));
+	return 0;
 }
 
 /** A guard to block multiple simultaneous promote()/demote() invocations. */
 static bool is_in_box_promote = false;
 
 /** Write and process a DEMOTE request. */
-static void
+static int
 box_issue_demote(uint32_t prev_leader_id, int64_t promote_lsn)
 {
 	assert(box_raft()->volatile_term == box_raft()->term);
 	assert(promote_lsn >= 0);
-	txn_limbo_begin(&txn_limbo);
-	txn_limbo_write_demote(&txn_limbo, promote_lsn,
-				box_raft()->term);
 	struct synchro_request req = {
 		.type = IPROTO_RAFT_DEMOTE,
 		.replica_id = prev_leader_id,
@@ -1814,9 +1813,14 @@ box_issue_demote(uint32_t prev_leader_id, int64_t promote_lsn)
 		.lsn = promote_lsn,
 		.term = box_raft()->term,
 	};
+	if (txn_limbo_begin(&txn_limbo, &req) != 0)
+		return -1;
+	txn_limbo_write_demote(&txn_limbo, promote_lsn,
+				box_raft()->term);
 	txn_limbo_apply(&txn_limbo, &req);
 	txn_limbo_commit(&txn_limbo);
 	assert(txn_limbo_is_empty(&txn_limbo));
+	return 0;
 }
 
 int
@@ -1839,8 +1843,7 @@ box_promote_qsync(void)
 		diag_set(ClientError, ER_NOT_LEADER, raft->leader);
 		return -1;
 	}
-	box_issue_promote(txn_limbo.owner_id, wait_lsn);
-	return 0;
+	return box_issue_promote(txn_limbo.owner_id, wait_lsn);
 }
 
 int
@@ -1933,8 +1936,7 @@ box_demote(void)
 	int64_t wait_lsn = box_wait_limbo_acked(replication_synchro_timeout);
 	if (wait_lsn < 0)
 		return -1;
-	box_issue_demote(txn_limbo.owner_id, wait_lsn);
-	return 0;
+	return box_issue_demote(txn_limbo.owner_id, wait_lsn);
 }
 
 int
