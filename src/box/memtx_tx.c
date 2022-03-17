@@ -349,17 +349,25 @@ void
 memtx_tx_handle_conflict(struct txn *breaker, struct txn *victim)
 {
 	assert(breaker->psn != 0);
-	if (victim->status != TXN_INPROGRESS) {
+	if (victim->status != TXN_INPROGRESS &&
+	    victim->status != TXN_IN_READ_VIEW) {
 		/* Was conflicted by somebody else. */
 		return;
 	}
 	if (stailq_empty(&victim->stmts)) {
-		/* Send to read view. */
-		victim->status = TXN_IN_READ_VIEW;
-		victim->rv_psn = breaker->psn;
-		rlist_add_tail(&txm.read_view_txs, &victim->in_read_view_txs);
+		/* Send to read view, perhaps a deeper one. */
+		if (victim->status != TXN_IN_READ_VIEW) {
+			victim->status = TXN_IN_READ_VIEW;
+			victim->rv_psn = breaker->psn;
+			rlist_add_tail(&txm.read_view_txs,
+				       &victim->in_read_view_txs);
+		} else {
+			victim->rv_psn = MIN(victim->rv_psn, breaker->psn);
+		}
 	} else {
 		/* Mark as conflicted. */
+		if (victim->status == TXN_IN_READ_VIEW)
+			rlist_del(&victim->in_read_view_txs);
 		victim->status = TXN_CONFLICTED;
 		txn_set_flags(victim, TXN_IS_CONFLICTED);
 	}
@@ -1910,9 +1918,27 @@ memtx_tx_tuple_clarify_impl(struct txn *txn, struct space *space,
 		if (memtx_tx_story_is_visible(story, txn, is_prepared_ok,
 					      &result, &own_change))
 			break;
+		if (story->add_psn != 0 && story->add_stmt != NULL &&
+		    txn != NULL) {
+			/*
+			 * If we skip prepared story then the transaction
+			 * must be before prepared in serialization order.
+			 * That can be a read view or conflict already.
+			 */
+			memtx_tx_handle_conflict(story->add_stmt->txn, txn);
+		}
 		if (story->link[index->dense_id].older_story == NULL)
 			break;
 		story = story->link[index->dense_id].older_story;
+	}
+	if (tuple != NULL && story->del_psn != 0 && story->del_stmt != NULL &&
+	    txn != NULL) {
+		/*
+		 * If we see a tuple that is deleted by prepared transaction
+		 * then the transaction must be before prepared in serialization
+		 * order. That can be a read view or conflict already.
+		 */
+		memtx_tx_handle_conflict(story->del_stmt->txn, txn);
 	}
 	if (!own_change) {
 		/*
@@ -1934,6 +1960,24 @@ memtx_tx_tuple_clarify_impl(struct txn *txn, struct space *space,
 
 /**
  * Helper of @sa memtx_tx_tuple_clarify.
+ * Detect and return is_prepared_ok flag.
+ */
+static bool
+detect_whether_prepared_ok(struct txn *txn)
+{
+	/*
+	 * The best efford that we can make for determining isolation level
+	 * is that decide is that a read-only transaction or not. For read
+	 * only (including autocommit select, that is txn == NULL) we should
+	 * choose READ_CONFIRMED that does not see prepared tuples in order
+	 * to avoid dirty read. For read-write transaction we should choose
+	 * READ_COMMITTED that see prepared tuples in order to avoid conflicts.
+	 */
+	return txn != NULL && !stailq_empty(&txn->stmts);
+}
+
+/**
+ * Helper of @sa memtx_tx_tuple_clarify.
  * Detect is_prepared_ok flag and pass the job to memtx_tx_tuple_clarify_impl.
  */
 struct tuple *
@@ -1941,7 +1985,7 @@ memtx_tx_tuple_clarify_slow(struct txn *txn, struct space *space,
 			    struct tuple *tuple, struct index *index,
 			    uint32_t mk_index)
 {
-	bool is_prepared_ok = txn != NULL;
+	bool is_prepared_ok = detect_whether_prepared_ok(txn);
 	return memtx_tx_tuple_clarify_impl(txn, space, tuple, index, mk_index,
 					   is_prepared_ok);
 }
@@ -1966,7 +2010,7 @@ memtx_tx_index_invisible_count_slow(struct txn *txn,
 		}
 
 		struct tuple *visible = NULL;
-		bool is_prepared_ok = txn != NULL;
+		bool is_prepared_ok = detect_whether_prepared_ok(txn);
 		memtx_tx_story_find_visible_tuple(story, txn, index->dense_id,
 						  is_prepared_ok, &visible);
 		if (visible == NULL)
