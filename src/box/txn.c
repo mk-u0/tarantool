@@ -45,6 +45,15 @@ double too_long_threshold;
 /** Last prepare-sequence-number that was assigned to prepared TX. */
 int64_t txn_last_psn = 0;
 
+enum txn_isolation_level default_isolation_level = TXN_ISOLATION_BEST_EFFORD;
+
+const char *txn_isolation_level_strs[txn_isolation_level_MAX] = {
+	"default",
+	"read-committed",
+	"read-confirmed",
+	"best-efford",
+};
+
 /* Txn cache. */
 static struct stailq txn_cache = {NULL, &txn_cache.first};
 
@@ -352,6 +361,7 @@ txn_begin(void)
 	txn->psn = 0;
 	txn->rv_psn = 0;
 	txn->status = TXN_INPROGRESS;
+	txn->isolation_level = default_isolation_level;
 	txn->signature = TXN_SIGNATURE_UNKNOWN;
 	txn->engine = NULL;
 	txn->engine_tx = NULL;
@@ -1180,6 +1190,47 @@ box_txn_set_timeout(double timeout)
 		return -1;
 	}
 	txn_set_timeout(txn, timeout);
+	return 0;
+}
+
+int
+box_txn_set_isolation_level(enum txn_isolation_level isolation_level)
+{
+	if (isolation_level < 0 || isolation_level >= txn_isolation_level_MAX) {
+		diag_set(ClientError, ER_ILLEGAL_PARAMS,
+			 "unknown isolation level");
+		return -1;
+	}
+	struct txn *txn = in_txn();
+	if (txn == NULL) {
+		diag_set(ClientError, ER_NO_TRANSACTION);
+		return -1;
+	}
+	if (!stailq_empty(&txn->stmts)) {
+		diag_set(ClientError, ER_ACTIVE_TRANSACTION);
+		return -1;
+	}
+	if (isolation_level == TXN_ISOLATION_DEFAULT)
+		isolation_level = default_isolation_level;
+	assert(isolation_level != TXN_ISOLATION_DEFAULT);
+	txn->isolation_level = isolation_level;
+	return 0;
+}
+
+int
+box_txn_set_default_isolation_level(enum txn_isolation_level isolation_level)
+{
+	if (isolation_level < 0 || isolation_level >= txn_isolation_level_MAX) {
+		diag_set(ClientError, ER_ILLEGAL_PARAMS,
+			 "unknown isolation level");
+		return -1;
+	}
+	if (isolation_level == TXN_ISOLATION_DEFAULT) {
+		diag_set(ClientError, ER_ILLEGAL_PARAMS,
+			 "can't set default isolation level to default");
+		return -1;
+	}
+	default_isolation_level = isolation_level;
 	return 0;
 }
 

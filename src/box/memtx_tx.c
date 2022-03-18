@@ -1965,6 +1965,13 @@ memtx_tx_tuple_clarify_impl(struct txn *txn, struct space *space,
 static bool
 detect_whether_prepared_ok(struct txn *txn)
 {
+	if (txn == NULL)
+		return false;
+	else if (txn->isolation_level == TXN_ISOLATION_READ_COMMITTED)
+		return true;
+	else if (txn->isolation_level == TXN_ISOLATION_READ_CONFIRMED)
+		return false;
+	assert(txn->isolation_level == TXN_ISOLATION_BEST_EFFORD);
 	/*
 	 * The best efford that we can make for determining isolation level
 	 * is that decide is that a read-only transaction or not. For read
@@ -1973,7 +1980,7 @@ detect_whether_prepared_ok(struct txn *txn)
 	 * to avoid dirty read. For read-write transaction we should choose
 	 * READ_COMMITTED that see prepared tuples in order to avoid conflicts.
 	 */
-	return txn != NULL && !stailq_empty(&txn->stmts);
+	return !stailq_empty(&txn->stmts);
 }
 
 /**

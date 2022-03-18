@@ -146,6 +146,38 @@ enum {
 	TXN_SIGNATURE_ABORT = JOURNAL_ENTRY_ERR_MIN - 4,
 };
 
+/** \cond public */
+/**
+ * When a transaction calls `commit`, this action can last for some time until
+ * redo data is written to WAL. While such a `commit` call is in progress we
+ * call changes of such a transaction as 'committed', and when the process is
+ * finished - we call the changes as 'confirmed'. One of the main options of
+ * a transaction is to see or not to see 'committed' changes.
+ * Warning: this enum is exposed in lua via ffi, and thus any change in items
+ * must be correspondingly modified on ffi.cdef(), see schema.lua.
+ */
+enum txn_isolation_level {
+	/** Take isolation level from global default_isolation_level. */
+	TXN_ISOLATION_DEFAULT,
+	/** Allow to read committed, but not confirmed changes. */
+	TXN_ISOLATION_READ_COMMITTED,
+	/** Allow to read only confirmed changes. */
+	TXN_ISOLATION_READ_CONFIRMED,
+	/** Determine isolation level automatically. */
+	TXN_ISOLATION_BEST_EFFORD,
+	/** Upper bound of valid values. */
+	txn_isolation_level_MAX,
+};
+
+extern const char *txn_isolation_level_strs[txn_isolation_level_MAX];
+/** \endcond public */
+
+/**
+ * The level that is actually set for a transaction is TXN_ISOLATION_DEFAULT
+ * is requested.
+ */
+extern enum txn_isolation_level default_isolation_level;
+
 /**
  * Convert a result of a transaction execution to an error installed into the
  * current diag.
@@ -364,6 +396,8 @@ struct txn {
 	int64_t rv_psn;
 	/** Status of the TX */
 	enum txn_status status;
+	/** Isolation level of TX */
+	enum txn_isolation_level isolation_level;
 	/** List of statements in a transaction. */
 	struct stailq stmts;
 	/** Number of new rows without an assigned LSN. */
@@ -879,6 +913,24 @@ box_txn_alloc(size_t size);
  */
 API_EXPORT int
 box_txn_set_timeout(double timeout);
+
+/**
+ * Set @a isolation_level for transaction. Must be called before the first DML.
+ * @retval 0 if success
+ * @retval -1 if failed, diag is set.
+ *
+ */
+API_EXPORT int
+box_txn_set_isolation_level(enum txn_isolation_level isolation_level);
+
+/**
+ * Set default @a isolation_level for further started transaction.
+ * @retval 0 if success
+ * @retval -1 if failed, diag is set.
+ *
+ */
+API_EXPORT int
+box_txn_set_default_isolation_level(enum txn_isolation_level isolation_level);
 
 /** \endcond public */
 

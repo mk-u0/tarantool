@@ -71,6 +71,18 @@ ffi.cdef[[
     box_txn_id();
     int
     box_txn_begin();
+    enum txn_isolation_level {
+        TXN_ISOLATION_DEFAULT,
+        TXN_ISOLATION_READ_COMMITTED,
+        TXN_ISOLATION_READ_CONFIRMED,
+        TXN_ISOLATION_BEST_EFFORD,
+        txn_isolation_level_MAX,
+    };
+    const char *txn_isolation_level_strs[txn_isolation_level_MAX];
+    int
+    box_txn_set_isolation_level(enum txn_isolation_level isolation_level);
+    int
+    box_txn_set_default_isolation_level(enum txn_isolation_level level);
     int
     box_txn_set_timeout(double timeout);
     /** \endcond public */
@@ -330,8 +342,38 @@ local function feedback_save_event(event)
     end
 end
 
+-- Extract isolation names from C, create and return name->ID map.
+local function collect_txn_isolation()
+    local res = {}
+    for i = 0, builtin.txn_isolation_level_MAX - 1 do
+        res[ffi.string(builtin.txn_isolation_level_strs[i])] = i
+    end
+    return res;
+end
+
+-- Convert to numeric the value of tnx isolation, raise an error if failed.
+local function normalize_txn_isolation(txn_isolation)
+    if type(txn_isolation) == 'string' then
+        txn_isolation = box.txn_isolation[txn_isolation]
+        if not txn_isolation then
+            box.error(box.error.ILLEGAL_PARAMS,
+                      "txn_isolation must be one of box.txn_isolation" ..
+                      " (keys or values)")
+        end
+    elseif type(txn_isolation) ~= 'number' then
+        box.error(box.error.ILLEGAL_PARAMS,
+                  "txn_isolation must be a string or number")
+    end
+    return txn_isolation
+end
+
+box.txn_isolation = collect_txn_isolation()
+
+box.internal.normalize_txn_isolation = normalize_txn_isolation
+
 box.begin = function(options)
     local timeout
+    local txn_isolation
     if options then
         check_param(options, 'options', 'table')
         timeout = options.timeout
@@ -339,12 +381,21 @@ box.begin = function(options)
             box.error(box.error.ILLEGAL_PARAMS,
                       "timeout must be a number greater than 0")
         end
+        txn_isolation = options.txn_isolation
+        if txn_isolation ~= nil then
+            txn_isolation = box.internal.normalize_txn_isolation(txn_isolation)
+        end
     end
     if builtin.box_txn_begin() == -1 then
         box.error()
     end
     if timeout then
         assert(builtin.box_txn_set_timeout(timeout) == 0)
+    end
+    if txn_isolation and
+       builtin.box_txn_set_isolation_level(txn_isolation) ~= 0 then
+        box.rollback()
+        box.error()
     end
 end
 

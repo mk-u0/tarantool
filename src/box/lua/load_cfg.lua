@@ -207,6 +207,7 @@ local template_cfg = {
     read_only           = 'boolean',
     hot_standby         = 'boolean',
     memtx_use_mvcc_engine = 'boolean',
+    default_txn_isolation = 'string, number',
     worker_pool_threads = 'number',
     election_mode       = 'string',
     election_timeout    = 'number',
@@ -281,6 +282,15 @@ local function check_replicaset_uuid()
     end
 end
 
+local function update_default_txn_isolation()
+    local level = box.cfg.default_txn_isolation
+    level = box.internal.normalize_txn_isolation(level)
+    local ffi = require('ffi')
+    if ffi.C.box_txn_set_default_isolation_level(level) == -1 then
+        box.error()
+    end
+end
+
 -- dynamically settable options
 --
 -- Note: An option should be in <dynamic_cfg_skip_at_load> table
@@ -336,6 +346,7 @@ local dynamic_cfg = {
     net_msg_max             = private.cfg_set_net_msg_max,
     sql_cache_size          = private.cfg_set_sql_cache_size,
     txn_timeout             = private.cfg_set_txn_timeout,
+    default_txn_isolation   = update_default_txn_isolation,
 }
 
 -- dynamically settable options, which should be reverted in case
@@ -670,6 +681,7 @@ local box_cfg_guard_whitelist = {
     ctl = true;
     watch = true;
     broadcast = true;
+    txn_isolation = true;
     NULL = true;
 };
 

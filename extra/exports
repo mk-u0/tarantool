@@ -101,6 +101,9 @@ box_txn_rollback
 box_txn_rollback_to_savepoint
 box_txn_savepoint
 box_txn_set_timeout
+txn_isolation_level_strs
+box_txn_set_isolation_level
+box_txn_set_default_isolation_level
 box_update
 box_upsert
 clock_monotonic
