@@ -1,0 +1,3 @@
+## bugfix/core
+
+* Now an isolation level can be specified in transactions when mvcc is enabled (gh-6930). It can be 'read-committed' when other transactions that have started committing are visible; 'read-confirmed' when only other transactions that have finished committing are visible; and 'best-efford' (default) that provide automatic switching between the previous two. The level may be set right in begin statement: box.begin{txn_isolation = 'read-committed'}; also the default level (which is 'best-efford' by default) can be set in configuration: box.cfg{default_txn_isolation = 'read-confirmed'}. In iproto there's a corresponding IPROTO_TXN_ISOLATION key in the body of IPROTO_BEGIN request. Also a couple of more or less correlated issues (gh-6421, gh-6246) was fixed.
