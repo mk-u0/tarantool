@@ -69,4 +69,4 @@ jobs:
         with:
           name: default_gcc_centos_7
           retention-days: 21
-          path: build/usr/src/*/tarantool-*/test/var/artifacts
+          path: ${{ env.VARDIR }}/artifacts
